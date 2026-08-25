@@ -10,11 +10,7 @@ from telegram.ext import (
     ContextTypes, Application
 )
 from database import BiasDatabase
-from messages import (
-    format_new_bias, format_target_hit, format_invalidation,
-    format_active_biases, format_stats, format_overall,
-    format_date_signals, format_leaderboard, format_coin_history
-)
+from messages import *
 
 # ==========================================
 # LOGGING & CONFIG
@@ -32,16 +28,19 @@ db = BiasDatabase()
 bot_instance: Application = None
 
 # ==========================================
-# BROADCAST FUNCTION
+# NON-BLOCKING BROADCAST ALERT
 # ==========================================
 async def broadcast_alert(text: str):
-    """Broadcasts signal to all users who pressed /start"""
     if not bot_instance or not bot_instance.bot:
         return
 
-    subscribers = db.get_active_subscribers()
-    logger.info(f"📢 Broadcasting alert to {len(subscribers)} subscribers...")
-    
+    # Database read offloaded to thread to keep async loop running
+    subscribers = await asyncio.to_thread(db.get_active_subscribers)
+    if not subscribers:
+        logger.warning("⚠️ No active bot subscribers found to broadcast to.")
+        return
+
+    logger.info(f"📢 Sending alerts to {len(subscribers)} users...")
     count = 0
     for uid in subscribers:
         try:
@@ -51,68 +50,90 @@ async def broadcast_alert(text: str):
                 disable_web_page_preview=True
             )
             count += 1
-            await asyncio.sleep(0.04)  # Stay safely under Telegram rate limits
+            await asyncio.sleep(0.04)  # Safeguard rate limiting
         except Exception as e:
-            # If user blocked the bot, deactivate them
             err_str = str(e).lower()
-            if "blocked" in err_str or "chat not found" in err_str or "user is deactivated" in err_str:
-                logger.info(f"User {uid} blocked/left bot. Deactivating.")
-                db.remove_subscriber(uid)
+            if any(k in err_str for k in ["blocked", "chat not found", "deactivated"]):
+                await asyncio.to_thread(db.remove_subscriber, uid)
             else:
-                logger.error(f"Failed to send to {uid}: {e}")
-
-    logger.info(f"✅ Alert successfully sent to {count}/{len(subscribers)} users.")
+                logger.error(f"Failed sending to {uid}: {e}")
+    logger.info(f"✅ Alert successfully sent to {count}/{len(subscribers)} active chats.")
 
 # ==========================================
-# WEBHOOK ENDPOINTS (aiohttp)
+# DECOUPLED ASYNC BACKGROUND WORKER
+# ==========================================
+async def process_webhook_payload(raw_text: str):
+    """Processes, saves, and broadcasts webhook payloads on a background loop"""
+    try:
+        if not raw_text or not raw_text.strip():
+            return
+
+        data = None
+        try:
+            data = json.loads(raw_text)
+        except Exception:
+            try:
+                # Fallback sanitation for single quotes or NaN values
+                sanitized = raw_text.replace("'", '"').replace("NaN", "0").replace("nan", "0")
+                data = json.loads(sanitized)
+            except Exception:
+                data = None
+
+        if isinstance(data, dict) and 'coin' in data:
+            data['coin'] = str(data.get('coin', 'UNKNOWN'))
+            data['timeframe'] = str(data.get('timeframe', 'TF'))
+            data['event'] = str(data.get('event', 'NEW_BIAS'))
+            data['bias'] = str(data.get('bias', 'NEUTRAL'))
+            data['timestamp'] = str(data.get('timestamp', datetime.utcnow().isoformat()))
+
+            # Offload blocking database write operation to separate thread
+            sid = await asyncio.to_thread(db.add_signal, data)
+            logger.info(f"💾 Background task stored signal #{sid}: {data['coin']}")
+
+            # Formulate telegram templates
+            if data['event'] == 'NEW_BIAS':
+                msg = format_new_bias(data)
+            elif data['event'] == 'TARGET_HIT':
+                msg = format_target_hit(data)
+            elif data['event'] == 'INVALIDATION':
+                msg = format_invalidation(data)
+            else:
+                msg = f"📊 Alert: {data['coin']} | {data['timeframe']} | {data['bias']}"
+
+            await broadcast_alert(msg)
+        else:
+            logger.info("Broadcasting raw text payload directly...")
+            await broadcast_alert(raw_text)
+
+    except Exception as e:
+        logger.error(f"❌ Error in background payload processor: {e}")
+
+# ==========================================
+# WEBHOOK ENDPOINT
 # ==========================================
 async def handle_webhook(request):
     try:
         raw_text = await request.text()
-        logger.info(f"📥 Received Webhook: {raw_text[:200]}")
-        data = json.loads(raw_text)
+        logger.info(f"📥 Received Webhook Burst: {len(raw_text)} bytes")
 
-        # Validate fields
-        for field in ['coin', 'timeframe', 'event', 'bias']:
-            if field not in data:
-                return web.json_response({"error": f"Missing field: {field}"}, status=400)
+        # ⚡ CRITICAL: Schedule execution to background, return 200 OK immediately (<5ms)
+        asyncio.create_task(process_webhook_payload(raw_text))
 
-        # Save to database
-        sid = db.add_signal(data)
-        logger.info(f"💾 Stored Signal #{sid}: {data['coin']} | {data['timeframe']} | {data['event']}")
-
-        # Format message
-        if data['event'] == 'NEW_BIAS':
-            msg = format_new_bias(data)
-        elif data['event'] == 'TARGET_HIT':
-            msg = format_target_hit(data)
-        elif data['event'] == 'INVALIDATION':
-            msg = format_invalidation(data)
-        else:
-            msg = f"Event: {data['event']}"
-
-        # Trigger broadcast asynchronously
-        asyncio.create_task(broadcast_alert(msg))
-
-        return web.json_response({"status": "ok", "signal_id": sid}, status=200)
-
-    except json.JSONDecodeError:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
+        return web.json_response({"status": "received", "message": "processing in background"}, status=200)
     except Exception as e:
-        logger.error(f"❌ Webhook error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        logger.error(f"Error catching webhook request: {e}")
+        return web.json_response({"status": "error_logged"}, status=200)
 
 async def handle_health(request):
-    total_users = len(db.get_active_subscribers())
+    total_users = len(await asyncio.to_thread(db.get_active_subscribers))
     return web.json_response({
         "status": "online",
-        "service": "The Bias Room Bot",
         "subscribers": total_users,
         "time": datetime.utcnow().isoformat()
     })
 
 # ==========================================
-# TELEGRAM BOT UI & COMMANDS
+# TELEGRAM BOT COMMANDS (FULLY THREAD-SAFE)
 # ==========================================
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -129,8 +150,7 @@ def main_menu_keyboard():
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    db.add_subscriber(u.id, u.username)
-    
+    await asyncio.to_thread(db.add_subscriber, u.id, u.username)
     welcome_text = (
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🏛️ 𝗧𝗛𝗘 𝗕𝗜𝗔𝗦 𝗥𝗢𝗢𝗠\n"
@@ -165,29 +185,34 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def cmd_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(format_active_biases(db.get_active_biases()))
+    biases = await asyncio.to_thread(db.get_active_biases)
+    await update.message.reply_text(format_active_biases(biases))
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(format_overall(db.get_overall_stats(30), 30))
+    stats = await asyncio.to_thread(db.get_overall_stats, 30)
+    await update.message.reply_text(format_overall(stats, 30))
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = datetime.utcnow().strftime('%Y-%m-%d')
-    await update.message.reply_text(format_date_signals(db.get_signals_by_date(d), d))
+    signals = await asyncio.to_thread(db.get_signals_by_date, d)
+    await update.message.reply_text(format_date_signals(signals, d))
 
 async def cmd_yesterday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
-    await update.message.reply_text(format_date_signals(db.get_signals_by_date(d), d))
+    signals = await asyncio.to_thread(db.get_signals_by_date, d)
+    await update.message.reply_text(format_date_signals(signals, d))
 
 async def cmd_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("💡 Usage: `/date 2024-03-25`", parse_mode="Markdown")
         return
     d = ctx.args[0]
-    await update.message.reply_text(format_date_signals(db.get_signals_by_date(d), d))
+    signals = await asyncio.to_thread(db.get_signals_by_date, d)
+    await update.message.reply_text(format_date_signals(signals, d))
 
 async def cmd_stats_coin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        coins = db.get_all_coins()
+        coins = await asyncio.to_thread(db.get_all_coins)
         if not coins:
             await update.message.reply_text("📭 No coins tracked yet.")
             return
@@ -202,11 +227,12 @@ async def cmd_stats_coin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Select a coin:", reply_markup=InlineKeyboardMarkup(kb))
         return
     coin = ctx.args[0].upper()
-    await update.message.reply_text(format_stats(db.get_stats(coin=coin, days=30), f"📊 {coin}", 30))
+    stats = await asyncio.to_thread(db.get_stats, coin, None, 30)
+    await update.message.reply_text(format_stats(stats, f"📊 {coin}", 30))
 
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        coins = db.get_all_coins()
+        coins = await asyncio.to_thread(db.get_all_coins)
         if not coins:
             await update.message.reply_text("📭 No history yet.")
             return
@@ -221,13 +247,16 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Select a coin:", reply_markup=InlineKeyboardMarkup(kb))
         return
     coin = ctx.args[0].upper()
-    await update.message.reply_text(format_coin_history(db.get_coin_history(coin), coin))
+    signals = await asyncio.to_thread(db.get_coin_history, coin)
+    await update.message.reply_text(format_coin_history(signals, coin))
 
 async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(format_leaderboard(db.get_best_performers(30), db.get_worst_performers(30), 30))
+    best = await asyncio.to_thread(db.get_best_performers, 30)
+    worst = await asyncio.to_thread(db.get_worst_performers, 30)
+    await update.message.reply_text(format_leaderboard(best, worst, 30))
 
 async def cmd_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    count, st = db.get_streak()
+    count, st = await asyncio.to_thread(db.get_streak)
     e = "🟢" if st == "WIN" else "🔴" if st == "LOSS" else "⚪"
     await update.message.reply_text(
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -239,7 +268,7 @@ async def cmd_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    coins = db.get_all_coins()
+    coins = await asyncio.to_thread(db.get_all_coins)
     if not coins:
         await update.message.reply_text("📭 No coins tracked yet.")
         return
@@ -250,10 +279,11 @@ async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(format_overall(db.get_overall_stats(7), 7))
+    stats = await asyncio.to_thread(db.get_overall_stats, 7)
+    await update.message.reply_text(format_overall(stats, 7))
 
 # ==========================================
-# BUTTON HANDLERS
+# BUTTON HANDLERS (THREAD-SAFE ASYNC)
 # ==========================================
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -264,12 +294,14 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🏛️ 𝗧𝗛𝗘 𝗕𝗜𝗔𝗦 𝗥𝗢𝗢𝗠\n\nChoose an option:", reply_markup=main_menu_keyboard())
 
     elif d == "active_all":
+        biases = await asyncio.to_thread(db.get_active_biases)
         kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="active_all"),
                InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
-        await q.edit_message_text(format_active_biases(db.get_active_biases()), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_active_biases(biases), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d.startswith("overall_"):
         days = int(d.split("_")[1])
+        stats = await asyncio.to_thread(db.get_overall_stats, days)
         kb = [
             [InlineKeyboardButton("7D", callback_data="overall_7"),
              InlineKeyboardButton("14D", callback_data="overall_14"),
@@ -278,10 +310,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("ALL", callback_data="overall_3650")],
             [InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
         ]
-        await q.edit_message_text(format_overall(db.get_overall_stats(days), days), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_overall(stats, days), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d == "stats_menu":
-        coins = db.get_all_coins()
+        coins = await asyncio.to_thread(db.get_all_coins)
         kb, row = [], []
         for c in coins[:20]:
             row.append(InlineKeyboardButton(c[:12], callback_data=f"coin_stats_{c}"))
@@ -295,18 +327,20 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d.startswith("coin_stats_"):
         coin = d.replace("coin_stats_", "")
+        stats = await asyncio.to_thread(db.get_stats, coin, None, 30)
         kb = [
             [InlineKeyboardButton("📜 History", callback_data=f"history_{coin}"),
              InlineKeyboardButton("📊 Active", callback_data=f"coin_active_{coin}")],
             [InlineKeyboardButton("🔙 Back", callback_data="stats_menu"),
              InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
         ]
-        await q.edit_message_text(format_stats(db.get_stats(coin=coin, days=30), f"📊 {coin}", 30), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_stats(stats, f"📊 {coin}", 30), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d.startswith("coin_active_"):
         coin = d.replace("coin_active_", "")
+        biases = await asyncio.to_thread(db.get_active_biases, coin)
         kb = [[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
-        await q.edit_message_text(format_active_biases(db.get_active_biases(coin=coin)), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_active_biases(biases), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d == "tf_menu":
         kb = [
@@ -319,9 +353,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d.startswith("tf_stats_"):
         tf = d.replace("tf_stats_", "")
+        stats = await asyncio.to_thread(db.get_stats, None, tf, 30)
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="tf_menu"),
                InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
-        await q.edit_message_text(format_stats(db.get_stats(timeframe=tf, days=30), f"⏰ {tf}", 30), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_stats(stats, f"⏰ {tf}", 30), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d == "date_menu":
         today = datetime.utcnow()
@@ -336,12 +371,13 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d.startswith("date_"):
         date = d.replace("date_", "")
+        signals = await asyncio.to_thread(db.get_signals_by_date, date)
         kb = [[InlineKeyboardButton("🔙 Dates", callback_data="date_menu"),
                InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
-        await q.edit_message_text(format_date_signals(db.get_signals_by_date(date), date), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_date_signals(signals, date), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d == "history_menu":
-        coins = db.get_all_coins()
+        coins = await asyncio.to_thread(db.get_all_coins)
         kb, row = [], []
         for c in coins[:20]:
             row.append(InlineKeyboardButton(c[:12], callback_data=f"history_{c}"))
@@ -355,21 +391,24 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d.startswith("history_"):
         coin = d.replace("history_", "")
+        signals = await asyncio.to_thread(db.get_coin_history, coin)
         kb = [[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
-        await q.edit_message_text(format_coin_history(db.get_coin_history(coin), coin), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_coin_history(signals, coin), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d.startswith("leader_"):
         days = int(d.split("_")[1])
+        best = await asyncio.to_thread(db.get_best_performers, days)
+        worst = await asyncio.to_thread(db.get_worst_performers, days)
         kb = [
             [InlineKeyboardButton("7D", callback_data="leader_7"),
              InlineKeyboardButton("30D", callback_data="leader_30"),
              InlineKeyboardButton("90D", callback_data="leader_90")],
             [InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
         ]
-        await q.edit_message_text(format_leaderboard(db.get_best_performers(days), db.get_worst_performers(days), days), reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(format_leaderboard(best, worst, days), reply_markup=InlineKeyboardMarkup(kb))
 
     elif d == "streak":
-        count, st = db.get_streak()
+        count, st = await asyncio.to_thread(db.get_streak)
         e = "🟢" if st == "WIN" else "🔴" if st == "LOSS" else "⚪"
         kb = [[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
         await q.edit_message_text(
@@ -387,16 +426,15 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("ℹ️ Type /help to view all bot commands.", reply_markup=InlineKeyboardMarkup(kb))
 
 # ==========================================
-# MAIN ASYNC SERVER LIFECYCLE
+# MAIN LIFECYCLE
 # ==========================================
 async def main():
     global bot_instance
-
     if not BOT_TOKEN:
-        logger.error("❌ ERROR: BOT_TOKEN is missing! Please add it in Railway Variables.")
+        logger.error("❌ ERROR: BOT_TOKEN is missing! Add it in Railway Variables.")
         return
 
-    # 1. Initialize Telegram Bot
+    # 1. Start Bot Polling Loop
     logger.info("🤖 Initializing Telegram Bot...")
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -419,9 +457,9 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     bot_instance = bot_app
-    logger.info("✅ Telegram Bot is actively listening for /start and commands!")
+    logger.info("✅ Bot is polling successfully!")
 
-    # 2. Initialize Webhook HTTP Server (aiohttp)
+    # 2. Start Decoupled HTTP Webhook Server (aiohttp)
     logger.info(f"🌐 Starting Webhook server on port {PORT}...")
     web_app = web.Application()
     web_app.router.add_post('/webhook', handle_webhook)
@@ -431,9 +469,8 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🚀 Everything is running! Listening for TradingView webhooks at /webhook")
+    logger.info("🚀 Everything is live! Listening for burst webhooks at /webhook")
 
-    # Keep running forever
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
