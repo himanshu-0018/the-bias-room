@@ -1,15 +1,19 @@
 import sqlite3
 import os
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
 
+logger = logging.getLogger("BiasDatabase")
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/bias_data.db")
 
 
 class BiasDatabase:
     def __init__(self):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        dirname = os.path.dirname(DB_PATH)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
         self.init_db()
 
     def get_conn(self):
@@ -19,68 +23,77 @@ class BiasDatabase:
         return conn
 
     def init_db(self):
-        conn = self.get_conn()
-        c = conn.cursor()
+        """Creates all required tables if they don't exist"""
+        try:
+            conn = self.get_conn()
+            c = conn.cursor()
 
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS bias_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                coin TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                event TEXT NOT NULL,
-                bias TEXT NOT NULL,
-                entry REAL,
-                target REAL,
-                invalidation REAL,
-                win_rate REAL,
-                wins INTEGER,
-                losses INTEGER,
-                total INTEGER,
-                timestamp TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                resolved INTEGER DEFAULT 0,
-                result TEXT DEFAULT NULL,
-                resolved_at TEXT DEFAULT NULL,
-                profit_pct REAL DEFAULT NULL
-            )
-        ''')
+            # 1. Main signals table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS bias_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    coin TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    bias TEXT NOT NULL,
+                    entry REAL,
+                    target REAL,
+                    invalidation REAL,
+                    win_rate REAL,
+                    wins INTEGER,
+                    losses INTEGER,
+                    total INTEGER,
+                    timestamp TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    resolved INTEGER DEFAULT 0,
+                    result TEXT DEFAULT NULL,
+                    resolved_at TEXT DEFAULT NULL,
+                    profit_pct REAL DEFAULT NULL
+                )
+            ''')
 
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS active_biases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                coin TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                bias TEXT NOT NULL,
-                entry REAL,
-                target REAL,
-                invalidation REAL,
-                win_rate REAL,
-                wins INTEGER,
-                losses INTEGER,
-                total INTEGER,
-                timestamp TEXT NOT NULL,
-                signal_id INTEGER,
-                UNIQUE(coin, timeframe)
-            )
-        ''')
+            # 2. Active biases table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS active_biases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    coin TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    bias TEXT NOT NULL,
+                    entry REAL,
+                    target REAL,
+                    invalidation REAL,
+                    win_rate REAL,
+                    wins INTEGER,
+                    losses INTEGER,
+                    total INTEGER,
+                    timestamp TEXT NOT NULL,
+                    signal_id INTEGER,
+                    UNIQUE(coin, timeframe)
+                )
+            ''')
 
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS subscribers (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                subscribed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                is_active INTEGER DEFAULT 1
-            )
-        ''')
+            # 3. Subscribers table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    subscribed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
+            logger.info("✅ Database tables verified/created successfully.")
+        except Exception as e:
+            logger.error(f"❌ Error initializing database: {e}")
 
     # ==========================================
     # WRITE OPERATIONS
     # ==========================================
 
     def add_signal(self, data: dict) -> int:
+        self.init_db()  # Safety check
         conn = self.get_conn()
         c = conn.cursor()
 
@@ -154,6 +167,7 @@ class BiasDatabase:
 
     def get_active_biases(self, coin: str = None,
                           timeframe: str = None) -> List[dict]:
+        self.init_db()  # Safety check
         conn = self.get_conn()
         c = conn.cursor()
         query = "SELECT * FROM active_biases WHERE 1=1"
@@ -173,6 +187,7 @@ class BiasDatabase:
     def get_stats(self, coin: str = None,
                   timeframe: str = None,
                   days: int = 30) -> List[dict]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -203,6 +218,7 @@ class BiasDatabase:
         return results
 
     def get_overall_stats(self, days: int = 30) -> dict:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -220,12 +236,14 @@ class BiasDatabase:
             WHERE event IN ('TARGET_HIT','INVALIDATION')
             AND timestamp >= ?
         ''', (since,))
-        result = dict(c.fetchone())
+        row = c.fetchone()
+        result = dict(row) if row else {}
         conn.close()
         return result
 
     def get_signals_by_date(self, date: str,
                             coin: str = None) -> List[dict]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         query = "SELECT * FROM bias_signals WHERE DATE(timestamp) = ?"
@@ -241,6 +259,7 @@ class BiasDatabase:
 
     def get_coin_history(self, coin: str,
                          limit: int = 20) -> List[dict]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         c.execute('''
@@ -252,6 +271,7 @@ class BiasDatabase:
         return results
 
     def get_all_coins(self) -> List[str]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         c.execute(
@@ -262,6 +282,7 @@ class BiasDatabase:
 
     def get_best_performers(self, days: int = 30,
                             limit: int = 5) -> List[dict]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -283,6 +304,7 @@ class BiasDatabase:
 
     def get_worst_performers(self, days: int = 30,
                              limit: int = 5) -> List[dict]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -303,6 +325,7 @@ class BiasDatabase:
         return results
 
     def get_streak(self, coin: str = None):
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         query = '''
@@ -329,6 +352,7 @@ class BiasDatabase:
         return count, streak_type
 
     def add_subscriber(self, user_id: int, username: str = None):
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         c.execute('''
@@ -339,6 +363,7 @@ class BiasDatabase:
         conn.close()
 
     def remove_subscriber(self, user_id: int):
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         c.execute(
@@ -348,6 +373,7 @@ class BiasDatabase:
         conn.close()
 
     def get_active_subscribers(self) -> List[int]:
+        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         c.execute(
