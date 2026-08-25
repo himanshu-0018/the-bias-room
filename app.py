@@ -1,21 +1,23 @@
 import os
 import json
-import time
+import asyncio
 import logging
-import threading
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
-import requests as http_requests
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, Application
 )
 from database import BiasDatabase
-from messages import *
+from messages import (
+    format_new_bias, format_target_hit, format_invalidation,
+    format_active_biases, format_stats, format_overall,
+    format_date_signals, format_leaderboard, format_coin_history
+)
 
 # ==========================================
-# CONFIGURATION
+# LOGGING & CONFIG
 # ==========================================
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -23,71 +25,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TheBiasRoom")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", 5000))
 
 db = BiasDatabase()
+bot_instance: Application = None
 
 # ==========================================
-# FLASK WEBHOOK SERVER
+# BROADCAST FUNCTION
 # ==========================================
-app = Flask(__name__)
+async def broadcast_alert(text: str):
+    """Broadcasts signal to all users who pressed /start"""
+    if not bot_instance or not bot_instance.bot:
+        return
 
-
-def send_direct_message(user_id: int, text: str):
-    """Sends a private message to a specific user via Telegram API"""
-    if not BOT_TOKEN:
-        return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": user_id,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    try:
-        resp = http_requests.post(url, json=payload, timeout=5)
-        # If user blocked the bot, deactivate them to save resources
-        if resp.status_code == 403:
-            logger.info(f"User {user_id} blocked bot. Deactivating.")
-            db.remove_subscriber(user_id)
-            return False
-        return resp.status_code == 200
-    except Exception as e:
-        logger.error(f"Error sending message to {user_id}: {e}")
-        return False
-
-
-def broadcast_to_all_users(text: str):
-    """Broadcasts alert to all active users who tapped /start"""
     subscribers = db.get_active_subscribers()
-    logger.info(f"Broadcasting alert to {len(subscribers)} users...")
+    logger.info(f"📢 Broadcasting alert to {len(subscribers)} subscribers...")
     
     count = 0
     for uid in subscribers:
-        success = send_direct_message(uid, text)
-        if success:
+        try:
+            await bot_instance.bot.send_message(
+                chat_id=uid,
+                text=text,
+                disable_web_page_preview=True
+            )
             count += 1
-        # Sleep 0.04s (~25 msg/sec) to stay well within Telegram rate limits
-        time.sleep(0.04)
-        
-    logger.info(f"Broadcast complete! Successfully sent to {count}/{len(subscribers)} users.")
+            await asyncio.sleep(0.04)  # Stay safely under Telegram rate limits
+        except Exception as e:
+            # If user blocked the bot, deactivate them
+            err_str = str(e).lower()
+            if "blocked" in err_str or "chat not found" in err_str or "user is deactivated" in err_str:
+                logger.info(f"User {uid} blocked/left bot. Deactivating.")
+                db.remove_subscriber(uid)
+            else:
+                logger.error(f"Failed to send to {uid}: {e}")
 
+    logger.info(f"✅ Alert successfully sent to {count}/{len(subscribers)} users.")
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+# ==========================================
+# WEBHOOK ENDPOINTS (aiohttp)
+# ==========================================
+async def handle_webhook(request):
     try:
-        raw = request.get_data(as_text=True)
-        logger.info(f"Received Webhook: {raw[:200]}")
-        data = json.loads(raw)
+        raw_text = await request.text()
+        logger.info(f"📥 Received Webhook: {raw_text[:200]}")
+        data = json.loads(raw_text)
 
-        # Validate required fields
-        for f in ['coin', 'timeframe', 'event', 'bias']:
-            if f not in data:
-                return jsonify({"error": f"Missing field: {f}"}), 400
+        # Validate fields
+        for field in ['coin', 'timeframe', 'event', 'bias']:
+            if field not in data:
+                return web.json_response({"error": f"Missing field: {field}"}, status=400)
 
         # Save to database
         sid = db.add_signal(data)
-        logger.info(f"Signal #{sid} saved: {data['coin']} | {data['timeframe']} | {data['event']}")
+        logger.info(f"💾 Stored Signal #{sid}: {data['coin']} | {data['timeframe']} | {data['event']}")
 
         # Format message
         if data['event'] == 'NEW_BIAS':
@@ -99,33 +91,29 @@ def webhook():
         else:
             msg = f"Event: {data['event']}"
 
-        # Send to all users in background so webhook returns 200 immediately
-        threading.Thread(target=broadcast_to_all_users, args=(msg,), daemon=True).start()
+        # Trigger broadcast asynchronously
+        asyncio.create_task(broadcast_alert(msg))
 
-        return jsonify({"status": "ok", "signal_id": sid}), 200
+        return web.json_response({"status": "ok", "signal_id": sid}, status=200)
 
     except json.JSONDecodeError:
-        return jsonify({"error": "Invalid JSON format"}), 400
+        return web.json_response({"error": "Invalid JSON"}, status=400)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"❌ Webhook error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
 
-
-@app.route("/health", methods=["GET"])
-def health():
+async def handle_health(request):
     total_users = len(db.get_active_subscribers())
-    return jsonify({
+    return web.json_response({
         "status": "online",
-        "service": "The Bias Room Public Bot",
-        "active_users": total_users,
+        "service": "The Bias Room Bot",
+        "subscribers": total_users,
         "time": datetime.utcnow().isoformat()
     })
-
 
 # ==========================================
 # TELEGRAM BOT UI & COMMANDS
 # ==========================================
-
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Active Biases", callback_data="active_all"),
@@ -139,10 +127,8 @@ def main_menu_keyboard():
         [InlineKeyboardButton("ℹ️ Help / Commands", callback_data="help")]
     ])
 
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    # Automatically register user in database
     db.add_subscriber(u.id, u.username)
     
     welcome_text = (
@@ -150,20 +136,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🏛️ 𝗧𝗛𝗘 𝗕𝗜𝗔𝗦 𝗥𝗢𝗢𝗠\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Welcome, {u.first_name}! 👋\n\n"
-        "✅ **You are now subscribed to Live Alerts!**\n"
-        "Every confirmed bias, target hit, and invalidation will be sent directly here in real time.\n\n"
-        "Use the menu below to explore active trades, win rates, and history:\n"
+        "✅ **You are subscribed to Live Alerts!**\n"
+        "New Biases, Target Hits, and Invalidations will be sent directly here in real time.\n\n"
+        "Explore current trades, stats, and historical results below:\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
-    await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard())
-
+    await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = (
         "━━━━━━━━━━━━━━━━━━━━\n"
         "ℹ️ 𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔹 /start — Main interactive menu\n"
+        "🔹 /start — Main interactive dashboard\n"
         "🔹 /active — View currently pending biases\n"
         "🔹 /stats — Total win rate & performance\n"
         "🔹 /stats_coin BTC/USDT — Coin specific stats\n"
@@ -174,29 +159,24 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔹 /leaderboard — Best & worst performing coins\n"
         "🔹 /streak — Current win/loss streak\n"
         "🔹 /coins — List of all tracked pairs\n"
-        "🔹 /week — Performance in the last 7 days\n"
+        "🔹 /week — Performance in last 7 days\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(msg)
 
-
 async def cmd_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_active_biases(db.get_active_biases()))
 
-
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_overall(db.get_overall_stats(30), 30))
-
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = datetime.utcnow().strftime('%Y-%m-%d')
     await update.message.reply_text(format_date_signals(db.get_signals_by_date(d), d))
 
-
 async def cmd_yesterday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
     await update.message.reply_text(format_date_signals(db.get_signals_by_date(d), d))
-
 
 async def cmd_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -204,7 +184,6 @@ async def cmd_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     d = ctx.args[0]
     await update.message.reply_text(format_date_signals(db.get_signals_by_date(d), d))
-
 
 async def cmd_stats_coin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -225,7 +204,6 @@ async def cmd_stats_coin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     coin = ctx.args[0].upper()
     await update.message.reply_text(format_stats(db.get_stats(coin=coin, days=30), f"📊 {coin}", 30))
 
-
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         coins = db.get_all_coins()
@@ -245,10 +223,8 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     coin = ctx.args[0].upper()
     await update.message.reply_text(format_coin_history(db.get_coin_history(coin), coin))
 
-
 async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_leaderboard(db.get_best_performers(30), db.get_worst_performers(30), 30))
-
 
 async def cmd_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     count, st = db.get_streak()
@@ -262,7 +238,6 @@ async def cmd_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
-
 async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     coins = db.get_all_coins()
     if not coins:
@@ -274,15 +249,12 @@ async def cmd_coins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg += f"\n📊 Total: {len(coins)}\n━━━━━━━━━━━━━━━━━━━━"
     await update.message.reply_text(msg)
 
-
 async def cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_overall(db.get_overall_stats(7), 7))
 
-
 # ==========================================
-# INLINE BUTTON CLICK HANDLER
+# BUTTON HANDLERS
 # ==========================================
-
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -414,14 +386,19 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]]
         await q.edit_message_text("ℹ️ Type /help to view all bot commands.", reply_markup=InlineKeyboardMarkup(kb))
 
-
 # ==========================================
-# BOT RUNNER (Background Thread)
+# MAIN ASYNC SERVER LIFECYCLE
 # ==========================================
+async def main():
+    global bot_instance
 
-def run_bot():
-    logger.info("Initializing Telegram Bot...")
-    bot_app = Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN:
+        logger.error("❌ ERROR: BOT_TOKEN is missing! Please add it in Railway Variables.")
+        return
+
+    # 1. Initialize Telegram Bot
+    logger.info("🤖 Initializing Telegram Bot...")
+    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     bot_app.add_handler(CommandHandler("start", cmd_start))
     bot_app.add_handler(CommandHandler("help", cmd_help))
@@ -438,20 +415,26 @@ def run_bot():
     bot_app.add_handler(CommandHandler("week", cmd_week))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
 
-    bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    bot_instance = bot_app
+    logger.info("✅ Telegram Bot is actively listening for /start and commands!")
 
+    # 2. Initialize Webhook HTTP Server (aiohttp)
+    logger.info(f"🌐 Starting Webhook server on port {PORT}...")
+    web_app = web.Application()
+    web_app.router.add_post('/webhook', handle_webhook)
+    web_app.router.add_get('/health', handle_health)
 
-# ==========================================
-# APPLICATION ENTRYPOINT
-# ==========================================
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🚀 Everything is running! Listening for TradingView webhooks at /webhook")
+
+    # Keep running forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    if BOT_TOKEN:
-        bot_thread = threading.Thread(target=run_bot, daemon=True)
-        bot_thread.start()
-        logger.info("Bot thread is running!")
-    else:
-        logger.warning("⚠️ No BOT_TOKEN found. Bot disabled.")
-
-    logger.info(f"Starting Webhook Server on port {PORT}...")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    asyncio.run(main())
