@@ -5,9 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 logger = logging.getLogger("BiasDatabase")
-
 DB_PATH = os.getenv("DATABASE_PATH", "/data/bias_data.db")
-
 
 class BiasDatabase:
     def __init__(self):
@@ -17,18 +15,16 @@ class BiasDatabase:
         self.init_db()
 
     def get_conn(self):
-        conn = sqlite3.connect(DB_PATH)
+        # Added 30-second busy timeout so concurrent writes wait instead of locking
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def init_db(self):
-        """Creates all required tables if they don't exist"""
         try:
             conn = self.get_conn()
             c = conn.cursor()
-
-            # 1. Main signals table
             c.execute('''
                 CREATE TABLE IF NOT EXISTS bias_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,8 +47,6 @@ class BiasDatabase:
                     profit_pct REAL DEFAULT NULL
                 )
             ''')
-
-            # 2. Active biases table
             c.execute('''
                 CREATE TABLE IF NOT EXISTS active_biases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,8 +65,6 @@ class BiasDatabase:
                     UNIQUE(coin, timeframe)
                 )
             ''')
-
-            # 3. Subscribers table
             c.execute('''
                 CREATE TABLE IF NOT EXISTS subscribers (
                     user_id INTEGER PRIMARY KEY,
@@ -81,22 +73,14 @@ class BiasDatabase:
                     is_active INTEGER DEFAULT 1
                 )
             ''')
-
             conn.commit()
             conn.close()
-            logger.info("✅ Database tables verified/created successfully.")
         except Exception as e:
             logger.error(f"❌ Error initializing database: {e}")
 
-    # ==========================================
-    # WRITE OPERATIONS
-    # ==========================================
-
     def add_signal(self, data: dict) -> int:
-        self.init_db()  # Safety check
         conn = self.get_conn()
         c = conn.cursor()
-
         c.execute('''
             INSERT INTO bias_signals
             (coin, timeframe, event, bias, entry, target,
@@ -124,50 +108,32 @@ class BiasDatabase:
                 data.get('wins'), data.get('losses'),
                 data.get('total'), data['timestamp'], signal_id
             ))
-
         elif data['event'] in ('TARGET_HIT', 'INVALIDATION'):
             result = 'WIN' if data['event'] == 'TARGET_HIT' else 'LOSS'
             profit = None
             if data.get('entry') and data.get('target'):
-                profit = abs(
-                    (data['target'] - data['entry'])
-                    / data['entry'] * 100
-                )
+                profit = abs((data['target'] - data['entry']) / data['entry'] * 100)
                 if data['event'] == 'INVALIDATION':
                     profit = -profit
 
             c.execute('''
                 UPDATE bias_signals
-                SET resolved = 1, result = ?,
-                    resolved_at = ?, profit_pct = ?
-                WHERE coin = ? AND timeframe = ?
-                AND event = 'NEW_BIAS' AND resolved = 0
+                SET resolved = 1, result = ?, resolved_at = ?, profit_pct = ?
+                WHERE coin = ? AND timeframe = ? AND event = 'NEW_BIAS' AND resolved = 0
                 ORDER BY id DESC LIMIT 1
-            ''', (result, data['timestamp'], profit,
-                  data['coin'], data['timeframe']))
+            ''', (result, data['timestamp'], profit, data['coin'], data['timeframe']))
 
             c.execute('''
-                UPDATE bias_signals
-                SET resolved = 1, result = ?, profit_pct = ?
-                WHERE id = ?
+                UPDATE bias_signals SET resolved = 1, result = ?, profit_pct = ? WHERE id = ?
             ''', (result, profit, signal_id))
 
-            c.execute('''
-                DELETE FROM active_biases
-                WHERE coin = ? AND timeframe = ?
-            ''', (data['coin'], data['timeframe']))
+            c.execute('DELETE FROM active_biases WHERE coin = ? AND timeframe = ?', (data['coin'], data['timeframe']))
 
         conn.commit()
         conn.close()
         return signal_id
 
-    # ==========================================
-    # READ OPERATIONS
-    # ==========================================
-
-    def get_active_biases(self, coin: str = None,
-                          timeframe: str = None) -> List[dict]:
-        self.init_db()  # Safety check
+    def get_active_biases(self, coin: str = None, timeframe: str = None) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
         query = "SELECT * FROM active_biases WHERE 1=1"
@@ -184,25 +150,19 @@ class BiasDatabase:
         conn.close()
         return results
 
-    def get_stats(self, coin: str = None,
-                  timeframe: str = None,
-                  days: int = 30) -> List[dict]:
-        self.init_db()
+    def get_stats(self, coin: str = None, timeframe: str = None, days: int = 30) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
         query = '''
-            SELECT coin, timeframe,
-                COUNT(*) as total,
+            SELECT coin, timeframe, COUNT(*) as total,
                 SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
                 SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
-                ROUND(AVG(CASE WHEN result='WIN'
-                    THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
+                ROUND(AVG(CASE WHEN result='WIN' THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
                 ROUND(AVG(profit_pct), 2) as avg_profit,
                 ROUND(SUM(profit_pct), 2) as total_profit
             FROM bias_signals
-            WHERE event IN ('TARGET_HIT','INVALIDATION')
-            AND timestamp >= ?
+            WHERE event IN ('TARGET_HIT','INVALIDATION') AND timestamp >= ?
         '''
         params = [since]
         if coin:
@@ -218,32 +178,26 @@ class BiasDatabase:
         return results
 
     def get_overall_stats(self, days: int = 30) -> dict:
-        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
         c.execute('''
-            SELECT
-                COUNT(*) as total,
+            SELECT COUNT(*) as total,
                 SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
                 SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
-                ROUND(AVG(CASE WHEN result='WIN'
-                    THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
+                ROUND(AVG(CASE WHEN result='WIN' THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
                 ROUND(AVG(profit_pct), 2) as avg_profit,
                 ROUND(SUM(profit_pct), 2) as total_profit,
                 COUNT(DISTINCT coin) as coins_tracked
             FROM bias_signals
-            WHERE event IN ('TARGET_HIT','INVALIDATION')
-            AND timestamp >= ?
+            WHERE event IN ('TARGET_HIT','INVALIDATION') AND timestamp >= ?
         ''', (since,))
         row = c.fetchone()
         result = dict(row) if row else {}
         conn.close()
         return result
 
-    def get_signals_by_date(self, date: str,
-                            coin: str = None) -> List[dict]:
-        self.init_db()
+    def get_signals_by_date(self, date: str, coin: str = None) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
         query = "SELECT * FROM bias_signals WHERE DATE(timestamp) = ?"
@@ -257,44 +211,33 @@ class BiasDatabase:
         conn.close()
         return results
 
-    def get_coin_history(self, coin: str,
-                         limit: int = 20) -> List[dict]:
-        self.init_db()
+    def get_coin_history(self, coin: str, limit: int = 20) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
-        c.execute('''
-            SELECT * FROM bias_signals
-            WHERE coin = ? ORDER BY timestamp DESC LIMIT ?
-        ''', (coin, limit))
+        c.execute('SELECT * FROM bias_signals WHERE coin = ? ORDER BY timestamp DESC LIMIT ?', (coin, limit))
         results = [dict(r) for r in c.fetchall()]
         conn.close()
         return results
 
     def get_all_coins(self) -> List[str]:
-        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
-        c.execute(
-            'SELECT DISTINCT coin FROM bias_signals ORDER BY coin')
+        c.execute('SELECT DISTINCT coin FROM bias_signals ORDER BY coin')
         results = [r['coin'] for r in c.fetchall()]
         conn.close()
         return results
 
-    def get_best_performers(self, days: int = 30,
-                            limit: int = 5) -> List[dict]:
-        self.init_db()
+    def get_best_performers(self, days: int = 30, limit: int = 5) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
         c.execute('''
             SELECT coin, timeframe, COUNT(*) as total,
                 SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
-                ROUND(AVG(CASE WHEN result='WIN'
-                    THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
+                ROUND(AVG(CASE WHEN result='WIN' THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
                 ROUND(SUM(profit_pct), 2) as total_profit
             FROM bias_signals
-            WHERE event IN ('TARGET_HIT','INVALIDATION')
-            AND timestamp >= ?
+            WHERE event IN ('TARGET_HIT','INVALIDATION') AND timestamp >= ?
             GROUP BY coin, timeframe HAVING total >= 3
             ORDER BY win_rate DESC LIMIT ?
         ''', (since, limit))
@@ -302,21 +245,17 @@ class BiasDatabase:
         conn.close()
         return results
 
-    def get_worst_performers(self, days: int = 30,
-                             limit: int = 5) -> List[dict]:
-        self.init_db()
+    def get_worst_performers(self, days: int = 30, limit: int = 5) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
         c.execute('''
             SELECT coin, timeframe, COUNT(*) as total,
                 SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
-                ROUND(AVG(CASE WHEN result='WIN'
-                    THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
+                ROUND(AVG(CASE WHEN result='WIN' THEN 1.0 ELSE 0.0 END)*100, 1) as win_rate,
                 ROUND(SUM(profit_pct), 2) as total_profit
             FROM bias_signals
-            WHERE event IN ('TARGET_HIT','INVALIDATION')
-            AND timestamp >= ?
+            WHERE event IN ('TARGET_HIT','INVALIDATION') AND timestamp >= ?
             GROUP BY coin, timeframe HAVING total >= 3
             ORDER BY win_rate ASC LIMIT ?
         ''', (since, limit))
@@ -325,13 +264,9 @@ class BiasDatabase:
         return results
 
     def get_streak(self, coin: str = None):
-        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
-        query = '''
-            SELECT result FROM bias_signals
-            WHERE event IN ('TARGET_HIT','INVALIDATION')
-        '''
+        query = "SELECT result FROM bias_signals WHERE event IN ('TARGET_HIT','INVALIDATION')"
         params = []
         if coin:
             query += " AND coin = ?"
@@ -352,32 +287,23 @@ class BiasDatabase:
         return count, streak_type
 
     def add_subscriber(self, user_id: int, username: str = None):
-        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO subscribers
-            (user_id, username, is_active) VALUES (?, ?, 1)
-        ''', (user_id, username))
+        c.execute('INSERT OR REPLACE INTO subscribers (user_id, username, is_active) VALUES (?, ?, 1)', (user_id, username))
         conn.commit()
         conn.close()
 
     def remove_subscriber(self, user_id: int):
-        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
-        c.execute(
-            'UPDATE subscribers SET is_active=0 WHERE user_id=?',
-            (user_id,))
+        c.execute('UPDATE subscribers SET is_active=0 WHERE user_id=?', (user_id,))
         conn.commit()
         conn.close()
 
     def get_active_subscribers(self) -> List[int]:
-        self.init_db()
         conn = self.get_conn()
         c = conn.cursor()
-        c.execute(
-            'SELECT user_id FROM subscribers WHERE is_active=1')
+        c.execute('SELECT user_id FROM subscribers WHERE is_active=1')
         results = [r['user_id'] for r in c.fetchall()]
         conn.close()
         return results
