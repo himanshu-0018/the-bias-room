@@ -88,11 +88,13 @@ async def process_webhook_payload(raw_text: str):
             data['timeframe'] = str(data.get('timeframe', 'TF'))
             data['event'] = str(data.get('event', 'NEW_BIAS'))
             data['bias'] = str(data.get('bias', 'NEUTRAL'))
-            data['timestamp'] = str(
-                data.get('timestamp', datetime.utcnow().isoformat())
-            )
 
-            # ✅ Explicit numeric casting — prevents type crashes
+            # ✅ CRITICAL FIX: Force clean ISO-8601 UTC timestamp
+            # TradingView sends raw millisecond strings that break SQLite date queries.
+            # We overwrite it with a proper format the DB can filter and sort.
+            data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            # Explicit numeric casting — prevents type crashes
             data['entry'] = float(data.get('entry') or 0)
             data['target'] = float(data.get('target') or 0)
             data['invalidation'] = float(data.get('invalidation') or 0)
@@ -106,7 +108,7 @@ async def process_webhook_payload(raw_text: str):
                 f"| {data['event']} | {data['bias']}"
             )
 
-            # ✅ Database write with full error visibility
+            # Database write with full error visibility
             try:
                 sid = await asyncio.to_thread(db.add_signal, data)
                 logger.info(f"💾 Signal #{sid} saved successfully.")
@@ -116,7 +118,7 @@ async def process_webhook_payload(raw_text: str):
                     f"Payload: {json.dumps(data)}\n"
                     f"Traceback: {traceback.format_exc()}"
                 )
-                return  # Don't broadcast if DB write failed
+                return
 
             # Format message
             if data['event'] == 'NEW_BIAS':
