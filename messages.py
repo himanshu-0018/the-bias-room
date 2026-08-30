@@ -90,6 +90,7 @@ def format_active_biases(biases: list) -> str:
     )
     for b in biases:
         e = "🟢" if b['bias'] == "BULLISH" else "🔴"
+        ts = (b.get('timestamp', '') or '')[:16].replace('T', ' ') or now.strftime('%Y-%m-%d %H:%M')
         msg += (
             f"{e} {b['coin']} | {b['timeframe']}\n"
             f"   📊 {b['bias']}\n"
@@ -98,7 +99,7 @@ def format_active_biases(biases: list) -> str:
             f"   ❌ Inval: {b['invalidation']}\n"
             f"   📈 WR: {b['win_rate']}%"
             f" ({b['wins']}/{b['total']})\n"
-            f"   🕐 Since: {b['timestamp'][:16]}\n\n"
+            f"   🕐 Since: {ts}\n\n"
         )
     msg += "━━━━━━━━━━━━━━━━━━━━"
     return msg
@@ -124,16 +125,18 @@ def format_stats(stats: list, title: str = "📊 STATS",
             f"🪙 {s['coin']} | {s['timeframe']}\n"
             f"   {bar}\n"
             f"   📈 WR: {wr}%\n"
-            f"   ✅ {s.get('wins', 0)} |"
-            f" ❌ {s.get('losses', 0)} |"
-            f" 📊 {s.get('total', 0)}\n"
-            f"   💰 Avg: {s.get('avg_profit', 0)}%\n\n"
+            f"   ✅ {s.get('wins', 0) or 0} |"
+            f" ❌ {s.get('losses', 0) or 0} |"
+            f" 📊 {s.get('total', 0) or 0}\n"
+            f"   💰 Avg: {s.get('avg_profit', 0.0) or 0.0}%\n\n"
         )
     msg += "━━━━━━━━━━━━━━━━━━━━"
     return msg
 
 
 def format_overall(stats: dict, days: int = 30) -> str:
+    if not stats:
+        stats = {}
     wr = stats.get('win_rate', 0) or 0
     bar = "🟩" * int(wr / 10) + "⬜" * (10 - int(wr / 10))
     return (
@@ -141,13 +144,13 @@ def format_overall(stats: dict, days: int = 30) -> str:
         f"🏆 𝗢𝗩𝗘𝗥𝗔𝗟𝗟 𝗦𝗧𝗔𝗧𝗦\n"
         f"📅 Last {days} days\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 Signals: {stats.get('total', 0)}\n"
-        f"✅ Wins: {stats.get('wins', 0)}\n"
-        f"❌ Losses: {stats.get('losses', 0)}\n"
-        f"🪙 Coins: {stats.get('coins_tracked', 0)}\n\n"
+        f"📊 Signals: {stats.get('total', 0) or 0}\n"
+        f"✅ Wins: {stats.get('wins', 0) or 0}\n"
+        f"❌ Losses: {stats.get('losses', 0) or 0}\n"
+        f"🪙 Coins: {stats.get('coins_tracked', 0) or 0}\n\n"
         f"📈 Win Rate:\n   {bar} {wr}%\n\n"
-        f"💰 Avg P/L: {stats.get('avg_profit', 0)}%\n"
-        f"💎 Total P/L: {stats.get('total_profit', 0)}%\n"
+        f"💰 Avg P/L: {stats.get('avg_profit', 0.0) or 0.0}%\n"
+        f"💎 Total P/L: {stats.get('total_profit', 0.0) or 0.0}%\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -165,12 +168,13 @@ def format_date_signals(signals: list, date: str) -> str:
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     for s in signals:
+        ts = (s.get('timestamp', '') or '')[11:16] or '00:00'
         if s['event'] == 'NEW_BIAS':
             e = "🟢" if s['bias'] == "BULLISH" else "🔴"
             res = {"WIN": "✅", "LOSS": "❌"}.get(
                 s.get('result'), "⏳")
             msg += (
-                f"🔔 {s['timestamp'][:16]}\n"
+                f"🔔 {ts}\n"
                 f"   {e} {s['coin']} | {s['timeframe']}"
                 f" | {s['bias']}\n"
                 f"   📍{s['entry']} → 🎯{s['target']}\n"
@@ -178,13 +182,13 @@ def format_date_signals(signals: list, date: str) -> str:
             )
         elif s['event'] == 'TARGET_HIT':
             msg += (
-                f"✅ {s['timestamp'][:16]}\n"
+                f"✅ {ts}\n"
                 f"   🎯 {s['coin']} | {s['timeframe']}"
                 f" Target Hit!\n\n"
             )
         elif s['event'] == 'INVALIDATION':
             msg += (
-                f"❌ {s['timestamp'][:16]}\n"
+                f"❌ {ts}\n"
                 f"   ⚠️ {s['coin']} | {s['timeframe']}"
                 f" Invalidated\n\n"
             )
@@ -202,20 +206,26 @@ def format_leaderboard(best: list, worst: list,
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🟢 𝗧𝗼𝗽 𝗣𝗲𝗿𝗳𝗼𝗿𝗺𝗲𝗿𝘀:\n"
     )
-    for i, b in enumerate(best[:5]):
-        m = medals[i] if i < len(medals) else "▪️"
-        msg += (
-            f"{m} {b['coin']} ({b['timeframe']})"
-            f" — {b['win_rate']}% WR"
-            f" ({b['wins']}/{b['total']})\n"
-        )
+    if not best:
+        msg += "▪️ No winning coins yet\n"
+    else:
+        for i, b in enumerate(best[:5]):
+            m = medals[i] if i < len(medals) else "▪️"
+            msg += (
+                f"{m} {b['coin']} ({b['timeframe']})"
+                f" — {b['win_rate']}% WR"
+                f" ({b['wins']}/{b['total']})\n"
+            )
     msg += "\n🔴 𝗪𝗼𝗿𝘀𝘁 𝗣𝗲𝗿𝗳𝗼𝗿𝗺𝗲𝗿𝘀:\n"
-    for w in worst[:5]:
-        msg += (
-            f"⚠️ {w['coin']} ({w['timeframe']})"
-            f" — {w['win_rate']}% WR"
-            f" ({w.get('losses', 0)}L)\n"
-        )
+    if not worst:
+        msg += "▪️ No losing coins yet\n"
+    else:
+        for w in worst[:5]:
+            msg += (
+                f"⚠️ {w['coin']} ({w['timeframe']})"
+                f" — {w['win_rate']}% WR"
+                f" ({w.get('losses', 0)}L)\n"
+            )
     msg += "\n━━━━━━━━━━━━━━━━━━━━"
     return msg
 
@@ -236,8 +246,9 @@ def format_coin_history(signals: list, coin: str) -> str:
         ev = {"NEW_BIAS": "🔔", "TARGET_HIT": "✅",
               "INVALIDATION": "❌"}.get(s['event'], "▪️")
         be = "🟢" if s['bias'] == "BULLISH" else "🔴"
+        ts = (s.get('timestamp', '') or '')[:16].replace('T', ' ') or 'N/A'
         msg += (
-            f"{ev} {s['timestamp'][:16]}\n"
+            f"{ev} {ts}\n"
             f"   {be} {s['timeframe']} |"
             f" {s['bias']} | {s['event']}\n"
         )
