@@ -124,7 +124,7 @@ class BiasDatabase:
                 else:
                     profit = -abs((inval_val - entry_val) / entry_val * 100)
 
-            # ✅ FIXED: Use nested subquery instead of ORDER BY/LIMIT in UPDATE
+            # Standard SQL-compliant nested subquery update
             c.execute('''
                 UPDATE bias_signals
                 SET resolved = 1, result = ?, resolved_at = ?, profit_pct = ?
@@ -174,7 +174,8 @@ class BiasDatabase:
                   days: int = 30) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
-        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        # ✅ Match ISO-8601 UTC format from webhook processor
+        since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
         query = '''
             SELECT coin, timeframe, COUNT(*) as total,
                 SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
@@ -203,7 +204,7 @@ class BiasDatabase:
     def get_overall_stats(self, days: int = 30) -> dict:
         conn = self.get_conn()
         c = conn.cursor()
-        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
         c.execute('''
             SELECT COUNT(*) as total,
                 SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
@@ -262,7 +263,7 @@ class BiasDatabase:
                             limit: int = 5) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
-        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
         c.execute('''
             SELECT coin, timeframe, COUNT(*) as total,
                 SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
@@ -283,7 +284,7 @@ class BiasDatabase:
                              limit: int = 5) -> List[dict]:
         conn = self.get_conn()
         c = conn.cursor()
-        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
         c.execute('''
             SELECT coin, timeframe, COUNT(*) as total,
                 SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
